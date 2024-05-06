@@ -1,0 +1,180 @@
+---
+name: Changes Comparison
+
+# Trigger: PR must be opened or reopened.
+on:
+  pull_request:
+    types: [opened, reopened]
+
+# If trigger, do:
+jobs:
+
+  # Job #1 - Retrieve metadata and save it in env files.
+  upload-artifacts:
+    name: setup
+    runs-on: ubuntu-latest
+    steps:
+      - name: Scrape HEADs
+        shell: bash
+        
+        # Scrape repository secrets and setup environment variables.
+        env:
+          USERNAME: $ {{ secrets.AUTH_UNAME }}
+          TOKEN: ${{ secrets.SECRET_TOKEN }}
+          REPO: ${{ secrets.REPO }}
+          OWNER: ${{ secrets.OWNER }}
+          
+        # Get open requests' and the trigger request's HEADs and save them in env files.
+        run: |
+          # Clear open_prs
+          echo "" > open_prs.txt
+          
+          # Get open PRs' numbers
+          if open_ids=`curl -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${{ env.TOKEN }}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ env.OWNER }}/${{ env.REPO }}/pulls \
+            | jq -r .[].number`; then
+            echo "Scraped the following numbers: $open_ids"
+            
+          fi
+          
+          # Iterate through the numbers, scrape additional information,
+          # construct a JSON object and save it in an env file
+          while IFS= read -r line; do
+            
+            if [ -z "$line" ]; then
+              continue
+            fi
+            
+            printf "LINE: "
+            printf "$line"
+            if open_head=`curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ env.TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/${{ env.OWNER }}/${{ env.REPO }}/pulls/${line}\
+              | jq -r .head.sha`; then
+              echo "Scraped $open_head"
+            fi
+            
+            if open_branch_name=`curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ env.TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/${{ env.OWNER }}/${{ env.REPO }}/pulls/${line}\
+              | jq -r .head.ref`; then
+              echo "Scraped $open_branch_name"
+            fi
+            
+            if open_url=`curl -L \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ env.TOKEN }}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              https://api.github.com/repos/${{ env.OWNER }}/${{ env.REPO }}/pulls/${line}\
+              | jq -r .url`; then
+              echo "Scraped $open_url"
+            fi
+            
+            # If information was scraped successfully, construct a JSON object,
+            # and save it in an env file.
+            if [[ "$open_url" && "$open_branch_name" && "$open_head" ]]; then
+              data_json="{\"name\": \"$open_branch_name\", \"head\": \"$open_head\", \"url\": \"$open_url\"}"
+              echo "$data_json" >> open_prs.txt
+              printf "SAVED "
+              printf "$data_json"
+            else
+              echo "Couldn't scrape information about pull request $line"
+            fi
+          done <<< "$open_ids"
+
+        # Upload the env files. name is ID. Must match downloads.
+      - name: upload open PR commit HEADs
+        uses: actions/upload-artifact@v4
+        with:
+          name: open_prs # Must match with download
+          path: open_prs.txt
+
+  # job #2 - Download the artifacts and use the data to compare changes between potentially divergent branches.
+  download-artifacts:
+    needs: upload-artifacts
+    runs-on: ubuntu-latest
+    
+    name: Compare Changes
+    steps:
+        # Get the repository,
+      - name: Get Repository
+        uses: actions/checkout@v4
+        
+        # Sign in with username and email and rebase main onto the local branch,
+        # Necessary to access the repository.
+      - name: Pull Latest Changes
+        shell: bash
+        run: |
+          git config --global user.email ${{ secrets.AUTH_EMAIL }}
+          git config --global user.name ${{ secrets.AUTH_UNAME }}
+          git config pull.rebase true
+          git pull origin main
+          git checkout main
+        # Ensure this step finished successfully before continuing,
+        # Else end task.
+        if: ${{ success() }}
+        
+        # Download artifacts. Must execute after checkout.
+      - name: Retrieve Open PR's
+        uses: actions/download-artifact@v4
+        with:
+          name: open_prs # Must match with upload
+        
+        # Scrape repository secrets and setup environment variables.
+      - shell: bash
+        name: Compare Changes
+        env:
+          USERNAME: ${{ secrets.AUTH_UNAME }}
+          TOKEN: ${{ secrets.SECRET_TOKEN }}
+          REPO: ${{ secrets.REPO }}
+          OWNER: ${{ secrets.OWNER }}
+          WEBHOOK: ${{ secrets.WEBHOOK_URL }}
+        # Iterate through open PR commits and compare changes between
+        # The trigger commit and other PR commits.
+        run: |
+          # Create an array object for successful rebases
+          successful_rebases=("*`echo "main"`* -> \n")
+          
+          # Update repository after downloading artifacts
+          git pull
+          
+          # make sure the artifact was downloaded successfully, 
+          if [ -e "open_prs.txt" ]; then
+            
+            # Iterate through the json objects
+            while IFS= read -r line; do
+              # First line is empty. If empty, continue
+              if [ -z "$line" ]; then
+                continue
+              else
+                
+                # Parse the JSON and extract the following information
+                name=$(echo "$line" | jq -r '.name')
+                head=$(echo "$line" | jq -r '.head')
+                url=$(echo "$line" | jq -r '.url')
+                
+                echo "Printing variable values:"
+                echo "successful_rebases: $successful_rebases"
+                echo "name: $name"
+                echo "head: $head"
+                echo "url: $url"
+                
+                # Try to rebase open branches onto the local branch,
+                # If conflict, send a message to our discord server.
+                git rebase "$head"|| { \
+                curl -H "Content-Type: application/json" -X POST -d '{"username": "Conflict Seeker","content": "**[CONFLICTING VERSIONS FOUND]** \n\n**Rebase Order:** \n'"$successful_rebases"'\n**Conflict Occurred** while rebasing '"$head ($name)"', \n'" $url"\"'}' "${WEBHOOK}"; exit 1; }
+                successful_rebases+="*`echo ${head}`* (`echo ${name}`)-> \n";
+              fi
+            done < open_prs.txt
+          else
+            echo "No open_prs.txt in directory"
+            exit 1
+          fi
+...
